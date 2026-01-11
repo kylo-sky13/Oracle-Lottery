@@ -7,6 +7,17 @@ import {
     AutomationCompatibleInterface
 } from "lib/chainlink/contracts/src/v0.8/automation/interfaces/AutomationCompatibleInterface.sol";
 
+/// @title OracleLottery
+/// @author kylo_sky
+/// @notice A fully on-chain lottery using Chainlink VRF for randomness and
+///         Chainlink Automation for trustless round execution.
+/// @dev One entry per address. Fixed entrance fee. Winner receives full pot.
+///      Includes timeout-based failure recovery and pull-based refunds.
+///
+/// State Machine:
+/// Open -> Drawing -> Open (success)
+/// Open -> Drawing -> Failed -> Open (refund + restart)
+
 contract OracleLottery is VRFConsumerBaseV2, AutomationCompatibleInterface {
     /*//////////////////////////////////////////////////////////////
                                 ERRORS
@@ -28,17 +39,26 @@ contract OracleLottery is VRFConsumerBaseV2, AutomationCompatibleInterface {
                                 EVENTS
     //////////////////////////////////////////////////////////////*/
 
+    /// @notice Emitted when a player successfully enters
     event Entered(address indexed player);
+
+    /// @notice Emitted when randomness request is sent to Chainlink VRF
     event RandomnessRequested(uint256 indexed requestId);
+
+    /// @notice Emitted when a winner is selected and paid
     event WinnerSelected(address indexed winner);
+
+    /// @notice Emitted if VRF callback times out and lottery enters Failed state
     event LotteryFailed();
+
+    /// @notice Emitted when a player successfully claims a refund
     event Refunded(address indexed player, uint256 amount);
 
     /*//////////////////////////////////////////////////////////////
                                 STATE
     //////////////////////////////////////////////////////////////*/
 
-    /* Type declarations */
+    /// @notice Lifecycle states of the lottery
     enum LotteryState {
         Open,
         Closed,
@@ -53,66 +73,78 @@ contract OracleLottery is VRFConsumerBaseV2, AutomationCompatibleInterface {
                            PLAYER STORAGE
     //////////////////////////////////////////////////////////////*/
 
-    // Unique list of players (one entry per address)
+    /// @notice Unique list of current round participants (one entry per address)
     address payable[] private players;
 
-    // Enforces one entry per address
+    /// @notice Ensures each address may only enter once per round
     mapping(address => bool) private hasEntered;
 
-    // Pull-based refund accounting (used only in Failed state)
+    /// @notice Tracks refundable balances if lottery enters Failed state
     mapping(address => uint256) private refundableAmount;
 
     /*//////////////////////////////////////////////////////////////
                           ETH ACCOUNTING
     //////////////////////////////////////////////////////////////*/
 
-    // Total ETH committed to the lottery (protocol accounting)
+    /// @notice Internal accounting of total ETH committed to current round(protocol accounting)
     uint256 private totalPot;
 
     /*//////////////////////////////////////////////////////////////
                            TIME TRACKING
     //////////////////////////////////////////////////////////////*/
 
-    // Timestamp of last successful state progression (used for interval)
+    /// @notice Timestamp of last completed round (used for interval)
     uint256 private lastTimestamp;
 
-    // Timestamp when Drawing state began (used for VRF timeout)
+    /// @notice Timestamp when Drawing state began (used for VRF timeout)
     uint256 private drawingStartedAt;
 
-    // Minimum time between rounds
+    /// @notice Minimum time interval between rounds
     uint256 private interval;
 
-    // Maximum time to wait for VRF before failure
+    /// @notice Maximum wait time for VRF callback before failure
     uint256 private drawTimeout;
 
     /*//////////////////////////////////////////////////////////////
                         ORACLE / VRF STATE
     //////////////////////////////////////////////////////////////*/
 
+    /// @notice Chainlink VRF Coordinator interface
     VRFCoordinatorV2Interface private immutable vrfCoordinator;
 
-    // Latest VRF request id (guards against double-fulfillment)
+    /// @notice Latest VRF request id
     uint256 private vrfRequestId;
 
-    // Winner recorded after successful completion
+    /// @notice Most recent lottery winner
     address private recentWinner;
 
     /*//////////////////////////////////////////////////////////////
                      IMMUTABLE CONFIGURATION
     //////////////////////////////////////////////////////////////*/
 
-    // Fixed ETH required to enter
+    /// @notice Fixed ETH amount required to enter
     uint256 private immutable entranceFee;
 
-    // Chainlink VRF configuration (fixed at deploy)
+    /// @notice Chainlink VRF subscription id
     uint64 private immutable subscriptionId;
+
+    /// @notice Chainlink VRF gas lane keyHash
     bytes32 private immutable gasLane;
+
+    /// @notice Gas limit for VRF callback
     uint32 private immutable callbackGasLimit;
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
+    /// @param _entranceFee ETH required to enter the lottery
+    /// @param _interval Minimum time between lottery rounds
+    /// @param _drawTimeout Max time to wait for VRF before failure
+    /// @param _subscriptionId Chainlink VRF subscription id
+    /// @param _gasLane Chainlink VRF keyHash
+    /// @param _callbackGasLimit Gas limit for VRF callback
+    /// @param _vrfCoordinator Address of Chainlink VRF Coordinator
     constructor(
         uint256 _entranceFee,
         uint256 _interval,
@@ -139,6 +171,8 @@ contract OracleLottery is VRFConsumerBaseV2, AutomationCompatibleInterface {
                           ENTRY FUNCTION
     //////////////////////////////////////////////////////////////*/
 
+    /// @notice Enter the lottery by paying exactly `entranceFee`
+    /// @dev Reverts if not Open, incorrect ETH, or already entered
     function enter() external payable {
         if (state != LotteryState.Open) {
             revert Lottery__NotOpen();
@@ -163,6 +197,9 @@ contract OracleLottery is VRFConsumerBaseV2, AutomationCompatibleInterface {
                      AUTOMATION (CHECK)
     //////////////////////////////////////////////////////////////*/
 
+    /// @notice Called by Chainlink Automation to check if upkeep is needed
+    /// @dev Returns true when enough time passed, players exist, state is Open,
+    ///      and internal accounting matches actual ETH balance
     function checkUpkeep(bytes calldata) external view override returns (bool upkeepNeeded, bytes memory) {
         // (bytes calldata) unused input required by Chainlink interface
         bool timePassed = (block.timestamp - lastTimestamp) >= interval;
@@ -176,6 +213,9 @@ contract OracleLottery is VRFConsumerBaseV2, AutomationCompatibleInterface {
     /*//////////////////////////////////////////////////////////////
                      AUTOMATION (PERFORM)
     //////////////////////////////////////////////////////////////*/
+
+    /// @notice Called by Chainlink Automation to start winner selection
+    /// @dev Transitions to Drawing and requests VRF randomness
     function performUpkeep(bytes calldata) external override {
         (bool upkeepNeeded,) = this.checkUpkeep("");
         if (!upkeepNeeded) {
@@ -199,6 +239,8 @@ contract OracleLottery is VRFConsumerBaseV2, AutomationCompatibleInterface {
                         VRF CALLBACK
     //////////////////////////////////////////////////////////////*/
 
+    /// @notice Callback invoked by Chainlink VRF with random number
+    /// @dev Selects winner, pays out pot, resets round
     function fulfillRandomWords(uint256 requestId, uint256[] memory randomWords) internal override {
         if (state != LotteryState.Drawing) revert Lottery__NotDrawing();
         if (requestId != vrfRequestId) revert Lottery__WrongRequestId();
@@ -234,6 +276,7 @@ contract OracleLottery is VRFConsumerBaseV2, AutomationCompatibleInterface {
                       FAILURE TRANSITION
     //////////////////////////////////////////////////////////////*/
 
+    /// @notice Transitions to Failed state if VRF timeout is exceeded
     function triggerFailure() external {
         if (state != LotteryState.Drawing) {
             revert Lottery__NotDrawing();
@@ -251,6 +294,7 @@ contract OracleLottery is VRFConsumerBaseV2, AutomationCompatibleInterface {
                           REFUND LOGIC
     //////////////////////////////////////////////////////////////*/
 
+    /// @notice Claim refund if lottery entered Failed state
     function refund() external {
         if (state != LotteryState.Failed) {
             revert Lottery__NotFailed();
@@ -343,5 +387,9 @@ contract OracleLottery is VRFConsumerBaseV2, AutomationCompatibleInterface {
 
     function getCallbackGasLimit() external view returns (uint32) {
         return callbackGasLimit;
+    }
+
+    function getVrfRequestId() external view returns (uint256) {
+        return vrfRequestId;
     }
 }
