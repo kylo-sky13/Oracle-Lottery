@@ -200,7 +200,7 @@ contract OracleLottery is VRFConsumerBaseV2, AutomationCompatibleInterface {
     /// @notice Called by Chainlink Automation to check if upkeep is needed
     /// @dev Returns true when enough time passed, players exist, state is Open,
     ///      and internal accounting matches actual ETH balance
-    function checkUpkeep(bytes calldata) external view override returns (bool upkeepNeeded, bytes memory) {
+    function checkUpkeep(bytes calldata) external view override returns (bool upkeepNeeded, bytes memory performData) {
         // (bytes calldata) unused input required by Chainlink interface
         bool timePassed = (block.timestamp - lastTimestamp) >= interval;
         bool hasPlayers = players.length > 0;
@@ -208,6 +208,7 @@ contract OracleLottery is VRFConsumerBaseV2, AutomationCompatibleInterface {
         bool accountingOk = address(this).balance == totalPot;
 
         upkeepNeeded = timePassed && hasPlayers && isOpen && accountingOk;
+        performData = "";
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -391,5 +392,13 @@ contract OracleLottery is VRFConsumerBaseV2, AutomationCompatibleInterface {
 
     function getVrfRequestId() external view returns (uint256) {
         return vrfRequestId;
+    }
+
+    function getHasEntered(address user) external view returns (bool) {
+        return hasEntered[user];
+    }
+
+    function getRefundableAmount(address user) external view returns (uint256) {
+        return refundableAmount[user];
     }
 }
